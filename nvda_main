@@ -1,0 +1,190 @@
+from alpha_vantage.timeseries import TimeSeries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
+from dash import dcc, html, Dash
+import plotly.graph_objs as go
+
+api_key = '***********'
+
+# Fetch full daily data for NVDA
+ts = TimeSeries(key=api_key, output_format='pandas')
+data, meta_data = ts.get_daily(symbol='NVDA', outputsize='full')
+
+if data.empty:
+    print("Failed to retrieve data.")
+    exit()
+
+# Prepare features for modeling
+data = data[['4. close', '5. volume']]
+data.rename(columns={'4. close': 'Close', '5. volume': 'Volume'}, inplace=True)
+data.index = pd.to_datetime(data.index)
+data.sort_index(inplace=True)
+
+data['Close_Lag1'] = data['Close'].shift(1)
+data['MA_10'] = data['Close'].rolling(10).mean()
+data['MA_50'] = data['Close'].rolling(50).mean()
+data['Returns'] = data['Close'].pct_change()
+data['Volatility_10'] = data['Returns'].rolling(10).std()
+data['Momentum_3'] = data['Close'] - data['Close'].shift(3)
+data['Volume_Change'] = data['Volume'].pct_change()
+data.dropna(inplace=True)
+
+# Train/test split by date
+train_data = data.loc[:'2020-12-31']
+test_data = data.loc['2021-01-01':]
+
+features = ['Close_Lag1', 'MA_10', 'MA_50', 'Volume',
+            'Volatility_10', 'Momentum_3', 'Volume_Change']
+
+X_train = train_data[features]
+y_train = train_data['Close']
+X_test = test_data[features]
+y_test = test_data['Close']
+
+model = RandomForestRegressor(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# Rolling prediction to simulate real forecasting
+rolling_test = test_data.copy()
+rolling_predictions = []
+last_close = train_data.iloc[-1]['Close']
+
+for i in range(len(rolling_test)):
+    close_lag = last_close if i == 0 else rolling_predictions[-1]
+
+    row = rolling_test.iloc[i]
+    input_features = pd.DataFrame([{
+        'Close_Lag1': close_lag,
+        'MA_10': row['MA_10'],
+        'MA_50': row['MA_50'],
+        'Volume': row['Volume'],
+        'Volatility_10': row['Volatility_10'],
+        'Momentum_3': row['Momentum_3'],
+        'Volume_Change': row['Volume_Change']
+    }])
+
+    pred = model.predict(input_features)[0]
+    rolling_predictions.append(pred)
+
+rolling_pred_series = pd.Series(rolling_predictions, index=rolling_test.index)
+mae = mean_absolute_error(y_test, rolling_pred_series)
+print(f"Mean Absolute Error (MAE): {mae:.2f}")
+
+# Forecast next 60 business days
+future_days = 60
+forecast_data = rolling_test.copy()
+predicted_dates = pd.date_range(start=forecast_data.index[-1] + pd.Timedelta(days=1), periods=future_days, freq='B')
+
+for date in predicted_dates:
+    close_lag = forecast_data.iloc[-1]['Close']
+    ma_10 = forecast_data['Close'].tail(10).mean()
+    ma_50 = forecast_data['Close'].tail(50).mean()
+    returns = forecast_data['Close'].pct_change().tail(10)
+    volatility_10 = returns.std()
+    momentum_3 = forecast_data['Close'].iloc[-1] - forecast_data['Close'].iloc[-4]
+    volume = forecast_data['Close'].iloc[-1]
+    volume_change = forecast_data['Volume'].pct_change().iloc[-1]
+
+    input_features = pd.DataFrame([{
+        'Close_Lag1': close_lag,
+        'MA_10': ma_10,
+        'MA_50': ma_50,
+        'Volume': volume,
+        'Volatility_10': volatility_10,
+        'Momentum_3': momentum_3,
+        'Volume_Change': volume_change
+    }])
+
+    predicted_close = model.predict(input_features)[0]
+
+    new_row = pd.DataFrame({
+        'Close': [predicted_close],
+        'Volume': [volume],
+        'Close_Lag1': [close_lag],
+        'MA_10': [ma_10],
+        'MA_50': [ma_50],
+        'Returns': [returns.iloc[-1] if not returns.empty else 0],
+        'Volatility_10': [volatility_10],
+        'Momentum_3': [momentum_3],
+        'Volume_Change': [volume_change]
+    }, index=[date])
+
+    forecast_data = pd.concat([forecast_data, new_row])
+
+# Create candlestick mockup for forecast visualization
+forecast_candle = forecast_data.tail(60).copy()
+forecast_candle['Open'] = forecast_candle['Close'].shift(1)
+forecast_candle['Open'].iloc[0] = forecast_data.iloc[-61]['Close']
+forecast_candle['High'] = forecast_candle['Close'] * (1 + np.random.uniform(0.01, 0.03, size=60))
+forecast_candle['Low'] = forecast_candle['Close'] * (1 - np.random.uniform(0.01, 0.03, size=60))
+forecast_candle = forecast_candle[['Open', 'High', 'Low', 'Close']]
+
+# Dash app setup
+app = Dash(__name__)
+app.title = "NVIDIA Stock Forecast Dashboard"
+
+candlestick = go.Candlestick(
+    x=forecast_candle.index,
+    open=forecast_candle['Open'],
+    high=forecast_candle['High'],
+    low=forecast_candle['Low'],
+    close=forecast_candle['Close'],
+    name="60-Day Forecast",
+    increasing_line_color='green',
+    decreasing_line_color='red'
+)
+
+line_chart = go.Scatter(
+    x=y_test.index,
+    y=y_test,
+    mode='lines',
+    name='Actual',
+    line=dict(color='blue')
+)
+
+forecast_line = go.Scatter(
+    x=forecast_data.index[-60:],
+    y=forecast_data['Close'].tail(60),
+    mode='lines',
+    name='Forecast Close',
+    line=dict(color='orange')
+)
+
+app.layout = html.Div([
+    html.H1("NVIDIA Stock Price Dashboard"),
+    html.Div([
+        html.H2("Model Performance Summary"),
+        html.P(f"Mean Absolute Error (MAE): ${mae:.2f}", style={'fontSize': '18px'}),
+        html.Hr()
+    ]),
+    dcc.Tabs([
+        dcc.Tab(label='Forecast Line Chart', children=[
+            dcc.Graph(figure={
+                'data': [line_chart, forecast_line],
+                'layout': go.Layout(
+                    title="NVIDIA Actual vs Forecast (60 Days)",
+                    xaxis_title="Date",
+                    yaxis_title="Price (USD)",
+                    template="plotly_white"
+                )
+            })
+        ]),
+        dcc.Tab(label='Candlestick Forecast', children=[
+            dcc.Graph(figure={
+                'data': [candlestick],
+                'layout': go.Layout(
+                    title="Simulated 60-Day Candlestick Forecast",
+                    xaxis_title="Date",
+                    yaxis_title="Price (USD)",
+                    template="plotly_white"
+                )
+            })
+        ])
+    ])
+])
+
+if __name__ == '__main__':
+    app.run_server(debug=True, port=8051)
