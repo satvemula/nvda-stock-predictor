@@ -1,190 +1,194 @@
-from alpha_vantage.timeseries import TimeSeries
-import pandas as pd
+import os
+import sys
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+from dotenv import load_dotenv
+from alpha_vantage.timeseries import TimeSeries
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 from dash import dcc, html, Dash
 import plotly.graph_objs as go
 
-api_key = '***********'
+# Load environment variables
+load_dotenv()
 
-# Fetch full daily data for NVDA
-ts = TimeSeries(key=api_key, output_format='pandas')
-data, meta_data = ts.get_daily(symbol='NVDA', outputsize='full')
+def fetch_data(symbol='NVDA'):
+    """Fetches full daily data from Alpha Vantage."""
+    api_key = os.getenv('ALPHA_VANTAGE_KEY')
+    if not api_key:
+        print("Error: ALPHA_VANTAGE_KEY not found in .env file.")
+        sys.exit(1)
 
-if data.empty:
-    print("Failed to retrieve data.")
-    exit()
+    try:
+        ts = TimeSeries(key=api_key, output_format='pandas')
+        data, _ = ts.get_daily(symbol=symbol, outputsize='full')
+        
+        # Clean and sort
+        data = data[['4. close', '5. volume']]
+        data.rename(columns={'4. close': 'Close', '5. volume': 'Volume'}, inplace=True)
+        data.index = pd.to_datetime(data.index)
+        data.sort_index(inplace=True)
+        return data
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return pd.DataFrame()
 
-# Prepare features for modeling
-data = data[['4. close', '5. volume']]
-data.rename(columns={'4. close': 'Close', '5. volume': 'Volume'}, inplace=True)
-data.index = pd.to_datetime(data.index)
-data.sort_index(inplace=True)
+def add_features(df):
+    """Generates technical indicators for the model."""
+    df = df.copy()
+    df['Close_Lag1'] = df['Close'].shift(1)
+    df['MA_10'] = df['Close'].rolling(10).mean()
+    df['MA_50'] = df['Close'].rolling(50).mean()
+    df['Returns'] = df['Close'].pct_change()
+    df['Volatility_10'] = df['Returns'].rolling(10).std()
+    df['Momentum_3'] = df['Close'] - df['Close'].shift(3)
+    df['Volume_Change'] = df['Volume'].pct_change()
+    df.dropna(inplace=True)
+    return df
 
-data['Close_Lag1'] = data['Close'].shift(1)
-data['MA_10'] = data['Close'].rolling(10).mean()
-data['MA_50'] = data['Close'].rolling(50).mean()
-data['Returns'] = data['Close'].pct_change()
-data['Volatility_10'] = data['Returns'].rolling(10).std()
-data['Momentum_3'] = data['Close'] - data['Close'].shift(3)
-data['Volume_Change'] = data['Volume'].pct_change()
-data.dropna(inplace=True)
+def train_model(data):
+    """Splits data and trains the Random Forest model."""
+    # Dynamic split: 80% train, 20% test
+    split_idx = int(len(data) * 0.8)
+    train_data = data.iloc[:split_idx]
+    test_data = data.iloc[split_idx:]
 
-# Train/test split by date
-train_data = data.loc[:'2020-12-31']
-test_data = data.loc['2021-01-01':]
+    features = ['Close_Lag1', 'MA_10', 'MA_50', 'Volume',
+                'Volatility_10', 'Momentum_3', 'Volume_Change']
+    
+    X_train = train_data[features]
+    y_train = train_data['Close']
+    
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    
+    return model, train_data, test_data, features
 
-features = ['Close_Lag1', 'MA_10', 'MA_50', 'Volume',
-            'Volatility_10', 'Momentum_3', 'Volume_Change']
+def run_forecast(model, test_data, features, days=60):
+    """Generates future predictions based on the trained model."""
+    forecast_data = test_data.copy()
+    
+    # Calculate start date for forecast (next business day after data ends)
+    last_date = forecast_data.index[-1]
+    predicted_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=days, freq='B')
 
-X_train = train_data[features]
-y_train = train_data['Close']
-X_test = test_data[features]
+    future_rows = []
+
+    # Iterative forecasting
+    for date in predicted_dates:
+        # Get latest metrics based on the appended forecast_data
+        current_tail = forecast_data if not future_rows else pd.concat([forecast_data, pd.DataFrame(future_rows)])
+        
+        close_lag = current_tail['Close'].iloc[-1]
+        ma_10 = current_tail['Close'].tail(10).mean()
+        ma_50 = current_tail['Close'].tail(50).mean()
+        returns = current_tail['Close'].pct_change().tail(10)
+        volatility_10 = returns.std()
+        momentum_3 = current_tail['Close'].iloc[-1] - current_tail['Close'].iloc[-4]
+        
+        # FIX: Use last known volume, not price
+        volume = current_tail['Volume'].iloc[-1] 
+        volume_change = current_tail['Volume'].pct_change().iloc[-1]
+
+        input_row = pd.DataFrame([{
+            'Close_Lag1': close_lag,
+            'MA_10': ma_10,
+            'MA_50': ma_50,
+            'Volume': volume,
+            'Volatility_10': volatility_10,
+            'Momentum_3': momentum_3,
+            'Volume_Change': volume_change
+        }])
+
+        pred_close = model.predict(input_row)[0]
+
+        new_row = {
+            'Close': pred_close,
+            'Volume': volume, # Assuming constant volume for forecast simplicity
+            'Close_Lag1': close_lag,
+            'MA_10': ma_10,
+            'MA_50': ma_50,
+            'Returns': 0, # Placeholder
+            'Volatility_10': volatility_10,
+            'Momentum_3': momentum_3,
+            'Volume_Change': volume_change
+        }
+        future_rows.append(pd.DataFrame(new_row, index=[date]))
+
+    future_df = pd.concat(future_rows)
+    return future_df
+
+# --- Main Execution ---
+print("Fetching Data...")
+raw_data = fetch_data()
+if raw_data.empty:
+    print("No data found. Exiting.")
+    sys.exit()
+
+print("Engineering Features...")
+processed_data = add_features(raw_data)
+
+print("Training Model...")
+model, train_data, test_data, features = train_model(processed_data)
+
+# Calculate MAE on Test Data
 y_test = test_data['Close']
+test_preds = model.predict(test_data[features])
+mae = mean_absolute_error(y_test, test_preds)
+print(f"Model MAE: {mae:.2f}")
 
-model = RandomForestRegressor(n_estimators=100, random_state=42)
-model.fit(X_train, y_train)
+print("Forecasting Future...")
+future_df = run_forecast(model, test_data, features, days=60)
 
-# Rolling prediction to simulate real forecasting
-rolling_test = test_data.copy()
-rolling_predictions = []
-last_close = train_data.iloc[-1]['Close']
+# Generate Candlestick Simulation for Visual Flair
+future_candle = future_df.copy()
+future_candle['Open'] = future_candle['Close'].shift(1).fillna(future_candle['Close'])
+future_candle['High'] = future_candle['Close'] * 1.02
+future_candle['Low'] = future_candle['Close'] * 0.98
 
-for i in range(len(rolling_test)):
-    close_lag = last_close if i == 0 else rolling_predictions[-1]
-
-    row = rolling_test.iloc[i]
-    input_features = pd.DataFrame([{
-        'Close_Lag1': close_lag,
-        'MA_10': row['MA_10'],
-        'MA_50': row['MA_50'],
-        'Volume': row['Volume'],
-        'Volatility_10': row['Volatility_10'],
-        'Momentum_3': row['Momentum_3'],
-        'Volume_Change': row['Volume_Change']
-    }])
-
-    pred = model.predict(input_features)[0]
-    rolling_predictions.append(pred)
-
-rolling_pred_series = pd.Series(rolling_predictions, index=rolling_test.index)
-mae = mean_absolute_error(y_test, rolling_pred_series)
-print(f"Mean Absolute Error (MAE): {mae:.2f}")
-
-# Forecast next 60 business days
-future_days = 60
-forecast_data = rolling_test.copy()
-predicted_dates = pd.date_range(start=forecast_data.index[-1] + pd.Timedelta(days=1), periods=future_days, freq='B')
-
-for date in predicted_dates:
-    close_lag = forecast_data.iloc[-1]['Close']
-    ma_10 = forecast_data['Close'].tail(10).mean()
-    ma_50 = forecast_data['Close'].tail(50).mean()
-    returns = forecast_data['Close'].pct_change().tail(10)
-    volatility_10 = returns.std()
-    momentum_3 = forecast_data['Close'].iloc[-1] - forecast_data['Close'].iloc[-4]
-    volume = forecast_data['Close'].iloc[-1]
-    volume_change = forecast_data['Volume'].pct_change().iloc[-1]
-
-    input_features = pd.DataFrame([{
-        'Close_Lag1': close_lag,
-        'MA_10': ma_10,
-        'MA_50': ma_50,
-        'Volume': volume,
-        'Volatility_10': volatility_10,
-        'Momentum_3': momentum_3,
-        'Volume_Change': volume_change
-    }])
-
-    predicted_close = model.predict(input_features)[0]
-
-    new_row = pd.DataFrame({
-        'Close': [predicted_close],
-        'Volume': [volume],
-        'Close_Lag1': [close_lag],
-        'MA_10': [ma_10],
-        'MA_50': [ma_50],
-        'Returns': [returns.iloc[-1] if not returns.empty else 0],
-        'Volatility_10': [volatility_10],
-        'Momentum_3': [momentum_3],
-        'Volume_Change': [volume_change]
-    }, index=[date])
-
-    forecast_data = pd.concat([forecast_data, new_row])
-
-# Create candlestick mockup for forecast visualization
-forecast_candle = forecast_data.tail(60).copy()
-forecast_candle['Open'] = forecast_candle['Close'].shift(1)
-forecast_candle['Open'].iloc[0] = forecast_data.iloc[-61]['Close']
-forecast_candle['High'] = forecast_candle['Close'] * (1 + np.random.uniform(0.01, 0.03, size=60))
-forecast_candle['Low'] = forecast_candle['Close'] * (1 - np.random.uniform(0.01, 0.03, size=60))
-forecast_candle = forecast_candle[['Open', 'High', 'Low', 'Close']]
-
-# Dash app setup
+# --- Dash App Layout ---
 app = Dash(__name__)
-app.title = "NVIDIA Stock Forecast Dashboard"
-
-candlestick = go.Candlestick(
-    x=forecast_candle.index,
-    open=forecast_candle['Open'],
-    high=forecast_candle['High'],
-    low=forecast_candle['Low'],
-    close=forecast_candle['Close'],
-    name="60-Day Forecast",
-    increasing_line_color='green',
-    decreasing_line_color='red'
-)
+app.title = "NVDA Stock AI Forecast"
 
 line_chart = go.Scatter(
-    x=y_test.index,
-    y=y_test,
-    mode='lines',
-    name='Actual',
-    line=dict(color='blue')
+    x=test_data.index, y=test_data['Close'],
+    mode='lines', name='Actual History (Test Set)', line=dict(color='#1f77b4')
 )
 
 forecast_line = go.Scatter(
-    x=forecast_data.index[-60:],
-    y=forecast_data['Close'].tail(60),
-    mode='lines',
-    name='Forecast Close',
-    line=dict(color='orange')
+    x=future_df.index, y=future_df['Close'],
+    mode='lines', name='AI Forecast (60 Days)', line=dict(color='#ff7f0e', dash='dot')
+)
+
+candlestick = go.Candlestick(
+    x=future_candle.index,
+    open=future_candle['Open'], high=future_candle['High'],
+    low=future_candle['Low'], close=future_candle['Close'],
+    name="Simulated Future Range"
 )
 
 app.layout = html.Div([
-    html.H1("NVIDIA Stock Price Dashboard"),
+    html.H1("NVIDIA Stock Price Predictor", style={'textAlign': 'center'}),
     html.Div([
-        html.H2("Model Performance Summary"),
-        html.P(f"Mean Absolute Error (MAE): ${mae:.2f}", style={'fontSize': '18px'}),
-        html.Hr()
-    ]),
+        html.H3(f"Model Accuracy (MAE): ${mae:.2f}", style={'color': 'darkgray'}),
+        html.P("Note: This model uses a Random Forest Regressor on lagging technical indicators."),
+    ], style={'textAlign': 'center', 'marginBottom': '30px'}),
+
     dcc.Tabs([
-        dcc.Tab(label='Forecast Line Chart', children=[
+        dcc.Tab(label='Trend Analysis', children=[
             dcc.Graph(figure={
                 'data': [line_chart, forecast_line],
-                'layout': go.Layout(
-                    title="NVIDIA Actual vs Forecast (60 Days)",
-                    xaxis_title="Date",
-                    yaxis_title="Price (USD)",
-                    template="plotly_white"
-                )
+                'layout': go.Layout(title="Price Trajectory", template="plotly_white")
             })
         ]),
-        dcc.Tab(label='Candlestick Forecast', children=[
+        dcc.Tab(label='Forecast Simulation', children=[
             dcc.Graph(figure={
                 'data': [candlestick],
-                'layout': go.Layout(
-                    title="Simulated 60-Day Candlestick Forecast",
-                    xaxis_title="Date",
-                    yaxis_title="Price (USD)",
-                    template="plotly_white"
-                )
+                'layout': go.Layout(title="60-Day Simulated Candle Forecast", template="plotly_white")
             })
         ])
     ])
-])
+], style={'fontFamily': 'Arial, sans-serif', 'maxWidth': '1000px', 'margin': '0 auto'})
 
 if __name__ == '__main__':
     app.run_server(debug=True, port=8051)
